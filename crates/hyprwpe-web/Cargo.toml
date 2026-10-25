@@ -1,0 +1,17 @@
+[package]
+name = "hyprwpe-web"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hyprwpe-core = { path = "../hyprwpe-core" }
+gtk4 = { version = "0.11", features = ["v4_10"] }
+gtk4-layer-shell = "0.8"
+webkit6 = "0.6"
+gio = "0.22"
+glib = "0.22"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+tiny_http = "0.12"
+urlencoding = "2.1"

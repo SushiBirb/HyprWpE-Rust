@@ -14,7 +14,7 @@ This project provides a set of scripts and a GTK4 graphical interface to find, c
 
       - **Video:** Plays video files using the efficient `mpvpaper`.
       - **Web:** Renders HTML, JS, and CSS based wallpapers using a `WebKitGTK` view.
-      - **Scene:** Renders fully animated 2D and 3D scenes using `linux-wallpaperengine`, bringing 100% shader-accurate animations natively to Linux Wayland/X11.
+      - **Scene:** Renders animated 2D and 3D scenes using a native WebGL2 pipeline (`scene_generator.py` and `glsl_preprocess.py`), transpiling Wallpaper Engine GLSL shaders directly to WebGL ES 300 without external C++ binary dependencies.
 
   - **Feature-Rich GUI:** A modern GTK4 application for browsing, searching, and filtering your installed wallpapers.
 
@@ -43,8 +43,8 @@ This project provides a set of scripts and a GTK4 graphical interface to find, c
       - It launches the appropriate renderer for the wallpaper type:
           - **Video:** `mpvpaper` displays the video on the target monitor, using properties from `properties.yaml`.
           - **Web:** `web_viewer.py` launches a `gtk4-layer-shell` window with an embedded web view.
-          - **Scene:** `linux-wallpaperengine` is launched directly, processing the `.pkg` and shaders natively to render the animated 3D scene on the Wayland root layer.
-4.  **Layering:** The `web_viewer.py` uses the `gtk4-layer-shell` protocol, while `linux-wallpaperengine` utilizes its native rendering paths to instruct Hyprland to place them on the background layer, making them function as proper wallpapers.
+          - **Scene:** `scene_generator.py` compiles the scene graph and transpiles shaders into a WebGL2 HTML page, rendered via `web_viewer.py` on the Wayland background layer.
+4.  **Layering:** Both `Web` and `Scene` wallpapers use `web_viewer.py` with `gtk4-layer-shell` to place windows directly on Hyprland's background layer.
 
 -----
 

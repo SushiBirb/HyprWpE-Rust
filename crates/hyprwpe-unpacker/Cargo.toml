@@ -1,0 +1,18 @@
+[package]
+name = "hyprwpe-unpacker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hyprwpe-core = { path = "../hyprwpe-core" }
+byteorder = "1.5"
+lz4_flex = "0.11"
+image = "0.24"
+texture2ddecoder = "0.1"
+zip = "0.6"
+serde_json = "1.0"
+thiserror = "1.0"
+rayon = "1.10"
+
+[dev-dependencies]
+tempfile = "3.8"

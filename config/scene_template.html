@@ -1,0 +1,1888 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>HyprWpE Scene Player</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { width: 100vw; height: 100vh; overflow: hidden; background: #000; }
+#glCanvas { width: 100%; height: 100%; display: block; }
+</style>
+</head>
+<body>
+<canvas id="glCanvas"></canvas>
+<audio id="sceneAudio" loop autoplay></audio>
+<script>
+// ============================================================================
+// HyprWpE native WebGL2 scene renderer.
+// Renders Wallpaper Engine scenes using the wallpaper's own effect shaders.
+// ============================================================================
+const SCENE = __SCENE_DATA_JSON__;
+
+function parseVec(val, def) {
+    if (Array.isArray(val)) return val.map(Number);
+    if (typeof val === 'string') {
+        const parts = val.trim().split(/\s+/).map(Number).filter(n => !isNaN(n));
+        if (parts.length > 0) return parts;
+    }
+    return def;
+}
+
+const canvas = document.getElementById('glCanvas');
+const gl = canvas.getContext('webgl2', {
+    alpha: true, premultipliedAlpha: true, antialias: false,
+    preserveDrawingBuffer: true, depth: false, stencil: false
+});
+if (!gl) { console.error('WebGL2 not supported'); }
+
+window.__SCENE_DEBUG__ = {
+    objects: SCENE.objects.map(o => ({ name: o.name, kind: o.kind,
+        effects: (o.effects||[]).map(e => e.name) })),
+    clearcolor: parseVec(SCENE.clearcolor, [0.2, 0.2, 0.2]),
+    projection: parseVec(SCENE.projection, [1920, 1080])
+};
+
+const projVec = parseVec(SCENE.projection, [1920, 1080]);
+const PROJ_W = projVec[0], PROJ_H = projVec[1];
+
+let RW = window.innerWidth;
+let RH = window.innerHeight;
+
+let mouseX = 0, mouseY = 0;
+window.addEventListener('mousemove', e => {
+    mouseX = (e.clientX / window.innerWidth - 0.5) * 2.0;
+    mouseY = -(e.clientY / window.innerHeight - 0.5) * 2.0;
+});
+
+function resize() {
+    const dpr = Math.max(window.devicePixelRatio || 1, 1);
+    RW = Math.ceil(window.innerWidth * dpr);
+    RH = Math.ceil(window.innerHeight * dpr);
+    canvas.width = RW;
+    canvas.height = RH;
+    gl.viewport(0, 0, RW, RH);
+}
+window.addEventListener('resize', () => { resize(); buildFBOs(); });
+resize();
+
+// ---- fullscreen quad ----
+const quad = (() => {
+    const p = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, p);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+        -1,-1,0,  1,-1,0,  -1,1,0,  -1,1,0,  1,-1,0,  1,1,0
+    ]), gl.STATIC_DRAW);
+    const t = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, t);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+        0,0,  1,0,  0,1,  0,1,  1,0,  1,1
+    ]), gl.STATIC_DRAW);
+    return { pos: p, tex: t };
+})();
+
+function bindQuad(program) {
+    const aPos = gl.getAttribLocation(program, 'a_Position');
+    const aTex = gl.getAttribLocation(program, 'a_TexCoord');
+    if (aPos >= 0) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, quad.pos);
+        gl.enableVertexAttribArray(aPos);
+        gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+    }
+    if (aTex >= 0) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, quad.tex);
+        gl.enableVertexAttribArray(aTex);
+        gl.vertexAttribPointer(aTex, 2, gl.FLOAT, false, 0, 0);
+    }
+}
+
+const meshBufferCache = {};
+function getMeshBuffers(meshKey, submesh) {
+    if (meshBufferCache[meshKey]) return meshBufferCache[meshKey];
+    const posBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(submesh.positions), gl.STATIC_DRAW);
+
+    const uvBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(submesh.texcoords), gl.STATIC_DRAW);
+
+    let normBuf = null;
+    if (submesh.normals && submesh.normals.length > 0) {
+        normBuf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, normBuf);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(submesh.normals), gl.STATIC_DRAW);
+    }
+
+    const idxBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(submesh.indices), gl.STATIC_DRAW);
+
+    const data = {
+        posBuf, uvBuf, normBuf, idxBuf,
+        indexCount: submesh.indices.length
+    };
+    meshBufferCache[meshKey] = data;
+    return data;
+}
+
+function bindMesh(program, buffers) {
+    const aPos = gl.getAttribLocation(program, 'a_Position');
+    const aTex = gl.getAttribLocation(program, 'a_TexCoord');
+    const aNorm = gl.getAttribLocation(program, 'a_Normal');
+
+    if (aPos >= 0) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffers.posBuf);
+        gl.enableVertexAttribArray(aPos);
+        gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+    }
+    if (aTex >= 0) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffers.uvBuf);
+        gl.enableVertexAttribArray(aTex);
+        gl.vertexAttribPointer(aTex, 2, gl.FLOAT, false, 0, 0);
+    }
+    if (aNorm >= 0 && buffers.normBuf) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffers.normBuf);
+        gl.enableVertexAttribArray(aNorm);
+        gl.vertexAttribPointer(aNorm, 3, gl.FLOAT, false, 0, 0);
+    }
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buffers.idxBuf);
+}
+
+function mat4Mul(a, b) {
+    const out = new Float32Array(16);
+    for (let r = 0; r < 4; r++) {
+        for (let c = 0; c < 4; c++) {
+            out[c * 4 + r] =
+                a[0 * 4 + r] * b[c * 4 + 0] +
+                a[1 * 4 + r] * b[c * 4 + 1] +
+                a[2 * 4 + r] * b[c * 4 + 2] +
+                a[3 * 4 + r] * b[c * 4 + 3];
+        }
+    }
+    return out;
+}
+
+function get3DModelMatrix(obj) {
+    const orig = parseVec(obj.origin, [0, 0, 0]);
+    const sc = parseVec(obj.scale, [1, 1, 1]);
+    const ang = parseVec(obj.angles, [0, 0, 0]);
+
+    let m = new Float32Array([
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        orig[0], orig[1], orig[2], 1
+    ]);
+
+    if (ang[2]) {
+        const cz = Math.cos(ang[2]), sz = Math.sin(ang[2]);
+        m = mat4Mul(m, new Float32Array([
+            cz, sz, 0, 0,
+            -sz, cz, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1
+        ]));
+    }
+    if (ang[1]) {
+        const cy = Math.cos(ang[1]), sy = Math.sin(ang[1]);
+        m = mat4Mul(m, new Float32Array([
+            cy, 0, -sy, 0,
+            0, 1, 0, 0,
+            sy, 0, cy, 0,
+            0, 0, 0, 1
+        ]));
+    }
+    if (ang[0]) {
+        const cx = Math.cos(ang[0]), sx = Math.sin(ang[0]);
+        m = mat4Mul(m, new Float32Array([
+            1, 0, 0, 0,
+            0, cx, sx, 0,
+            0, -sx, cx, 0,
+            0, 0, 0, 1
+        ]));
+    }
+
+    const sm = new Float32Array([
+        sc[0], 0, 0, 0,
+        0, sc[1], 0, 0,
+        0, 0, sc[2] !== undefined ? sc[2] : 1, 0,
+        0, 0, 0, 1
+    ]);
+    return mat4Mul(m, sm);
+}
+
+function getCameraViewProjMatrix() {
+    const cam = SCENE.camera || {};
+    const eye = parseVec(cam.eye, [0, 0, 0]);
+    const center = parseVec(cam.center, [0, 0, -1]);
+    const up = parseVec(cam.up, [0, 1, 0]);
+
+    let z = [eye[0] - center[0], eye[1] - center[1], eye[2] - center[2]];
+    let len = Math.hypot(...z) || 1.0;
+    z = z.map(v => v / len);
+    let x = [up[1] * z[2] - up[2] * z[1], up[2] * z[0] - up[0] * z[2], up[0] * z[1] - up[1] * z[0]];
+    len = Math.hypot(...x) || 1.0;
+    x = x.map(v => v / len);
+    let y = [z[1] * x[2] - z[2] * x[1], z[2] * x[0] - z[0] * x[2], z[0] * x[1] - z[1] * x[0]];
+
+    const V = new Float32Array([
+        x[0], y[0], z[0], 0,
+        x[1], y[1], z[1], 0,
+        x[2], y[2], z[2], 0,
+        -(x[0]*eye[0] + x[1]*eye[1] + x[2]*eye[2]),
+        -(y[0]*eye[0] + y[1]*eye[1] + y[2]*eye[2]),
+        -(z[0]*eye[0] + z[1]*eye[1] + z[2]*eye[2]),
+        1
+    ]);
+
+    const aspect = RW / RH;
+    const fov = (SCENE.camera && SCENE.camera.fov) || (SCENE.general && SCENE.general.fov) || 50.0;
+    const f = 1.0 / Math.tan((fov * 0.5) * Math.PI / 180.0);
+    const near = (SCENE.general && SCENE.general.nearz) ? Number(SCENE.general.nearz) : 0.01;
+    const far = (SCENE.general && SCENE.general.farz) ? Number(SCENE.general.farz) : 1000.0;
+    const nf = 1.0 / (near - far);
+
+    const P = new Float32Array([
+        f / aspect, 0, 0, 0,
+        0, f, 0, 0,
+        0, 0, (far + near) * nf, -1,
+        0, 0, 2 * far * near * nf, 0
+    ]);
+
+    return mat4Mul(P, V);
+}
+
+function compile(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+        const log = gl.getShaderInfoLog(s);
+        if (!compile._seen) compile._seen = new Set();
+        const key = type + ':' + log + ':' + src.length;
+        if (!compile._seen.has(key)) {
+            compile._seen.add(key);
+            console.error('shader compile error:\n' + log + '\n--- source ---\n' + src.split('\n').map((l,i)=>(i+1)+': '+l).join('\n'));
+        }
+        gl.deleteShader(s); return null;
+    }
+    return s;
+}
+function link(vsSrc, fsSrc) {
+    const vs = compile(gl.VERTEX_SHADER, vsSrc);
+    const fs = compile(gl.FRAGMENT_SHADER, fsSrc);
+    if (!vs || !fs) return null;
+    const p = gl.createProgram();
+    gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+        console.error('program link error: ' + gl.getProgramInfoLog(p));
+        return null;
+    }
+    return p;
+}
+
+const texCache = {};
+function loadTexture(url) {
+    if (!url || url.startsWith('_rt_') || url === 'previous' || url === 'emptyTex') return Promise.resolve(null);
+    if (texCache[url]) return Promise.resolve(texCache[url]);
+    return new Promise(resolve => {
+        let settled = false;
+        const finish = (entry) => {
+            if (settled) return;
+            settled = true;
+            texCache[url] = entry;
+            resolve(entry);
+        };
+        const timer = setTimeout(() => {
+            finish({ tex: emptyTex.tex, w: 1, h: 1, fallback: true });
+        }, 5000);
+
+        const img = new Image();
+        img.onload = () => {
+            clearTimeout(timer);
+            const t = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, t);
+            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+            const UNPACK_PREMULT = gl.UNPACK_PREMULTIPLIED_ALPHA_WEBGL || 0x9241;
+            if (UNPACK_PREMULT) try { gl.pixelStorei(UNPACK_PREMULT, false); } catch(e) {}
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+            const isTiling = url && (
+                url.includes('normal') || url.includes('noise') || url.includes('ripple') ||
+                url.includes('caustics') || url.includes('flow') || url.includes('effects/')
+            ) && !url.includes('mask');
+            const wrapMode = isTiling ? gl.REPEAT : gl.CLAMP_TO_EDGE;
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrapMode);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrapMode);
+            try {
+                gl.generateMipmap(gl.TEXTURE_2D);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+            } catch(e) {
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            }
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            const isWhite = url && (url.includes('white') || url.includes('solidlayer'));
+            const isFallback = !isWhite && (img.naturalWidth <= 1 && img.naturalHeight <= 1);
+            finish({ tex: t, w: img.naturalWidth, h: img.naturalHeight, fallback: isFallback });
+        };
+        img.onerror = () => {
+            clearTimeout(timer);
+            const t = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, t);
+            const isWhite = url && (url.includes('white') || url.includes('solidlayer'));
+            const data = isWhite ? new Uint8Array([255, 255, 255, 255]) : new Uint8Array([0, 0, 0, 0]);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+            finish({ tex: t, w: 1, h: 1, fallback: !isWhite });
+        };
+        img.src = url;
+    });
+}
+
+function createFallbackTex() {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 0]));
+    return { tex: t, w: 1, h: 1, fallback: true };
+}
+const emptyTex = createFallbackTex();
+
+let fboA = null, fboB = null;
+function createFBO(w, h) {
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { fbo, tex, w, h };
+}
+function buildFBOs() {
+    if (fboA) { gl.deleteFramebuffer(fboA.fbo); gl.deleteTexture(fboA.tex); }
+    if (fboB) { gl.deleteFramebuffer(fboB.fbo); gl.deleteTexture(fboB.tex); }
+    fboA = createFBO(RW, RH);
+    fboB = createFBO(RW, RH);
+}
+buildFBOs();
+
+const IDENTITY = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+
+const programUniformInfoCache = new WeakMap();
+
+function getProgramUniforms(prog) {
+    let info = programUniformInfoCache.get(prog);
+    if (!info) {
+        info = {};
+        const count = gl.getProgramParameter(prog, gl.ACTIVE_UNIFORMS);
+        for (let i = 0; i < count; i++) {
+            const activeInfo = gl.getActiveUniform(prog, i);
+            if (activeInfo) {
+                const rawName = activeInfo.name;
+                const cleanName = rawName.replace(/\[0\]$/, '');
+                const loc = gl.getUniformLocation(prog, rawName);
+                const entry = { loc, type: activeInfo.type, size: activeInfo.size, name: cleanName };
+                info[cleanName] = entry;
+                info[cleanName.toLowerCase()] = entry;
+                if (!cleanName.startsWith('g_')) {
+                    info['g_' + cleanName] = entry;
+                    info['g_' + cleanName.toLowerCase()] = entry;
+                }
+                if (!cleanName.startsWith('u_')) {
+                    info['u_' + cleanName] = entry;
+                    info['u_' + cleanName.toLowerCase()] = entry;
+                }
+            }
+        }
+        programUniformInfoCache.set(prog, info);
+    }
+    return info;
+}
+
+function setUniforms(prog, uniforms) {
+    if (!uniforms) return;
+    const info = getProgramUniforms(prog);
+    for (const [name, rawVal] of Object.entries(uniforms)) {
+        const u = info[name] || info[name.toLowerCase()] || info['g_' + name.toLowerCase()] || info['u_' + name.toLowerCase()];
+        if (!u || !u.loc) continue;
+
+        let val = rawVal;
+        if (val && typeof val === 'object' && !Array.isArray(val) && 'value' in val) {
+            val = val.value;
+        }
+        if (typeof val === 'string') {
+            const nums = val.trim().split(/\s+/).map(Number).filter(n => !isNaN(n));
+            if (nums.length === 1) val = nums[0];
+            else if (nums.length > 1) val = nums;
+        }
+
+        const type = u.type;
+        if (type === 0x1406) { // FLOAT
+            const num = (Array.isArray(val) ? val[0] : (typeof val === 'boolean' ? (val ? 1 : 0) : Number(val))) || 0;
+            gl.uniform1f(u.loc, num);
+        } else if (type === 0x8B50) { // FLOAT_VEC2
+            let x = 0, y = 0;
+            if (Array.isArray(val)) {
+                x = Number(val[0]) || 0;
+                y = Number(val[1] !== undefined ? val[1] : val[0]) || 0;
+            } else {
+                x = Number(val) || 0; y = x;
+            }
+            gl.uniform2f(u.loc, x, y);
+        } else if (type === 0x8B51) { // FLOAT_VEC3
+            let x = 0, y = 0, z = 0;
+            if (Array.isArray(val)) {
+                x = Number(val[0]) || 0;
+                y = Number(val[1] !== undefined ? val[1] : val[0]) || 0;
+                z = Number(val[2] !== undefined ? val[2] : (val[1] !== undefined ? val[1] : val[0])) || 0;
+            } else {
+                x = Number(val) || 0; y = x; z = x;
+            }
+            gl.uniform3f(u.loc, x, y, z);
+        } else if (type === 0x8B52) { // FLOAT_VEC4
+            let x = 0, y = 0, z = 0, w = 1.0;
+            if (Array.isArray(val)) {
+                x = Number(val[0]) || 0;
+                y = Number(val[1] !== undefined ? val[1] : val[0]) || 0;
+                z = Number(val[2] !== undefined ? val[2] : 0) || 0;
+                w = Number(val[3] !== undefined ? val[3] : 1.0);
+            } else {
+                x = Number(val) || 0; y = x; z = x; w = 1.0;
+            }
+            gl.uniform4f(u.loc, x, y, z, w);
+        } else if (type === 0x1404 || type === 0x8B56 || type === 0x8B5E) { // INT, BOOL, SAMPLER_2D
+            const num = (Array.isArray(val) ? val[0] : (typeof val === 'boolean' ? (val ? 1 : 0) : Number(val))) || 0;
+            gl.uniform1i(u.loc, Math.round(num));
+        } else if (type === 0x8B53 || type === 0x8B57) { // INT_VEC2, BOOL_VEC2
+            let x = 0, y = 0;
+            if (Array.isArray(val)) {
+                x = Number(val[0]) || 0;
+                y = Number(val[1] !== undefined ? val[1] : val[0]) || 0;
+            } else {
+                x = Number(val) || 0; y = x;
+            }
+            gl.uniform2i(u.loc, Math.round(x), Math.round(y));
+        }
+    }
+}
+
+function bindTextureSlot(slot, entry) {
+    if (!entry) return null;
+    gl.activeTexture(gl.TEXTURE0 + slot);
+    gl.bindTexture(gl.TEXTURE_2D, entry.tex);
+    if (slot === 0) {
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    }
+    return entry;
+}
+
+const PASS_VERT = `#version 300 es
+in vec3 a_Position; in vec2 a_TexCoord; out vec2 v_TexCoord;
+uniform mat4 g_ModelViewProjectionMatrix;
+uniform vec2 g_Texture0Translation;
+uniform vec4 g_Texture0Rotation;
+void main(){
+    vec2 tc = a_TexCoord;
+    if (g_Texture0Rotation.x != 0.0 || g_Texture0Rotation.y != 0.0) {
+        tc = tc * g_Texture0Rotation.xy + g_Texture0Translation;
+    }
+    v_TexCoord = tc;
+    gl_Position = g_ModelViewProjectionMatrix * vec4(a_Position, 1.0);
+}`;
+
+const PREPARE_FRAG = `#version 300 es
+precision highp float;
+in vec2 v_TexCoord; out vec4 out_FragColor;
+uniform sampler2D g_Texture0; uniform vec4 g_Color4; uniform float g_Brightness;
+void main(){ vec4 c = texture(g_Texture0, v_TexCoord); c.rgb *= g_Brightness; c *= g_Color4; out_FragColor = c; }`;
+
+const COMPOSITE_FRAG = `#version 300 es
+precision highp float;
+in vec2 v_TexCoord; out vec4 out_FragColor;
+uniform sampler2D g_Texture0;
+uniform int u_Premultiply;
+void main(){
+    vec4 c = texture(g_Texture0, v_TexCoord);
+    if (u_Premultiply == 1) {
+        c.rgb *= c.a;
+    }
+    out_FragColor = c;
+}`;
+
+const prepareProg = link(PASS_VERT, PREPARE_FRAG);
+const compositeProg = link(PASS_VERT, COMPOSITE_FRAG);
+
+const PARTICLE_VERT = `#version 300 es
+in vec3 a_Position;
+in vec2 a_TexCoord;
+in vec4 a_Color;
+out vec2 v_TexCoord;
+out vec4 v_Color;
+uniform mat4 g_ModelViewProjectionMatrix;
+void main() {
+    v_TexCoord = a_TexCoord;
+    v_Color = a_Color;
+    gl_Position = g_ModelViewProjectionMatrix * vec4(a_Position, 1.0);
+}`;
+
+const PARTICLE_FRAG = `#version 300 es
+precision highp float;
+in vec2 v_TexCoord;
+in vec4 v_Color;
+out vec4 out_FragColor;
+uniform sampler2D g_Texture0;
+uniform float g_Overbright;
+uniform int u_BlendMode;
+void main() {
+    vec4 tex = texture(g_Texture0, v_TexCoord);
+    vec4 color = tex * v_Color;
+    color.rgb *= g_Overbright;
+    if (u_BlendMode == 1) {
+        if (max(color.r, max(color.g, color.b)) * color.a < 0.01) discard;
+    } else {
+        if (color.a < 0.01) discard;
+    }
+    out_FragColor = color;
+}`;
+
+const particleProg = link(PARTICLE_VERT, PARTICLE_FRAG);
+
+let particleVao = null;
+let particleVbo = null;
+let particleVertexData = new Float32Array(300 * 6 * 9);
+
+function initParticleBuffers() {
+    if (particleVao) return;
+    particleVao = gl.createVertexArray();
+    gl.bindVertexArray(particleVao);
+    particleVbo = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, particleVbo);
+    gl.bufferData(gl.ARRAY_BUFFER, particleVertexData.byteLength, gl.DYNAMIC_DRAW);
+
+    const stride = 9 * 4;
+    const posLoc = gl.getAttribLocation(particleProg, 'a_Position');
+    const uvLoc = gl.getAttribLocation(particleProg, 'a_TexCoord');
+    const colLoc = gl.getAttribLocation(particleProg, 'a_Color');
+
+    if (posLoc >= 0) {
+        gl.enableVertexAttribArray(posLoc);
+        gl.vertexAttribPointer(posLoc, 3, gl.FLOAT, false, stride, 0);
+    }
+    if (uvLoc >= 0) {
+        gl.enableVertexAttribArray(uvLoc);
+        gl.vertexAttribPointer(uvLoc, 2, gl.FLOAT, false, stride, 3 * 4);
+    }
+    if (colLoc >= 0) {
+        gl.enableVertexAttribArray(colLoc);
+        gl.vertexAttribPointer(colLoc, 4, gl.FLOAT, false, stride, 5 * 4);
+    }
+    gl.bindVertexArray(null);
+}
+
+class ParticleSystem {
+    constructor(def) {
+        this.def = def;
+        const ov = def.instanceoverride || {};
+        const countMult = (ov.count !== undefined) ? Number(ov.count) : 1.0;
+        this.maxCount = Math.min(Math.round((def.maxcount || 100) * countMult), 500);
+        this.particles = [];
+        this.emitAcc = 0;
+        this.emitters = def.emitter || [];
+        this.initializers = def.initializer || [];
+        this.operators = def.operator || [];
+        this.renderer = (def.renderer && def.renderer[0]) ? def.renderer[0] : { name: 'sprite' };
+        this.isRope = this.renderer.name === 'ropetrail' || this.renderer.name === 'spritetrail';
+        this.trailLength = Number(this.renderer.length || 0.25);
+        this.material = def.material || {};
+        this.texture = this.material.texture || '';
+        this.blending = this.material.blending || 'additive';
+        this.overbright = Number(this.material.overbright || 1.0);
+
+        this.origin = parseVec(def.origin, [0, 0, 0]);
+        this.scale = parseVec(def.scale, [1.0, 1.0, 1.0]);
+        this.angles = parseVec(def.angles, [0, 0, 0]);
+        this.childType = def.child_type || null;
+        this.parentId = def.parent_particle_id !== undefined ? def.parent_particle_id : null;
+        this.spritesheet = def.spritesheet || null;
+        this.sequenceMultiplier = Number(def.sequencemultiplier || 1.0);
+
+        const starttime = Math.min(def.starttime || 0, 15);
+        if (starttime > 0) {
+            const step = 0.1;
+            for (let t = 0; t < starttime; t += step) {
+                this.update(step, t);
+            }
+        }
+    }
+
+    spawn(now) {
+        if (this.particles.length >= this.maxCount) return;
+
+        const ov = this.def.instanceoverride || {};
+        const speedMult = (ov.speed !== undefined) ? Number(ov.speed) : 1.0;
+        const sizeMult = (ov.size !== undefined) ? Number(ov.size) : 1.0;
+        const lifeMult = (ov.lifetime !== undefined) ? Number(ov.lifetime) : 1.0;
+        const alphaMult = (ov.alpha !== undefined) ? Number(ov.alpha) : (this.def.alpha !== undefined ? Number(this.def.alpha) : 1.0);
+        const colorTint = ov.colorn ? parseVec(ov.colorn, [1, 1, 1]) : (this.def.color ? parseVec(this.def.color, [1, 1, 1]) : [1, 1, 1]);
+
+        let spawnPos = [this.origin[0], this.origin[1], this.origin[2]];
+        const rotZ = this.angles[2] || 0;
+        const cosR = Math.cos(rotZ);
+        const sinR = Math.sin(rotZ);
+
+        for (const em of this.emitters) {
+            const emOrigin = parseVec(em.origin, [0, 0, 0]);
+            let ex = emOrigin[0];
+            let ey = emOrigin[1];
+            if (rotZ !== 0) {
+                const rx = ex * cosR - ey * sinR;
+                const ry = ex * sinR + ey * cosR;
+                ex = rx; ey = ry;
+            }
+            spawnPos[0] += ex;
+            spawnPos[1] += ey;
+            spawnPos[2] += emOrigin[2];
+
+            if (em.name === 'sphererandom') {
+                const distMin = em.distancemin || 0;
+                const distMax = em.distancemax || 100;
+                const dir = parseVec(em.directions, [1, 1, 1]);
+                const angle = Math.random() * Math.PI * 2;
+                const dist = distMin + Math.random() * (distMax - distMin);
+                let dx = Math.cos(angle) * dist * dir[0];
+                let dy = Math.sin(angle) * dist * dir[1];
+                if (rotZ !== 0) {
+                    const rdx = dx * cosR - dy * sinR;
+                    const rdy = dx * sinR + dy * cosR;
+                    dx = rdx; dy = rdy;
+                }
+                spawnPos[0] += dx;
+                spawnPos[1] += dy;
+            } else if (em.name === 'boxrandom') {
+                const distMax = parseVec(em.distancemax, [100, 100, 0]);
+                let dx = (Math.random() * 2 - 1) * distMax[0] * this.scale[0];
+                let dy = (Math.random() * 2 - 1) * distMax[1] * this.scale[1];
+                if (rotZ !== 0) {
+                    const rdx = dx * cosR - dy * sinR;
+                    const rdy = dx * sinR + dy * cosR;
+                    dx = rdx; dy = rdy;
+                }
+                spawnPos[0] += dx;
+                spawnPos[1] += dy;
+            }
+        }
+
+        let lifetime = 10;
+        let size = 20;
+        let vel = [0, 0, 0];
+        let color = [1, 1, 1];
+        let alpha = 1.0;
+        let rot = 0;
+        let angVel = 0;
+
+        for (const init of this.initializers) {
+            if (init.name === 'lifetimerandom') {
+                const min = init.min !== undefined ? init.min : 1;
+                const max = init.max !== undefined ? init.max : 10;
+                lifetime = (min + Math.random() * (max - min)) * lifeMult;
+            } else if (init.name === 'sizerandom') {
+                const min = init.min !== undefined ? init.min : 10;
+                const max = init.max !== undefined ? init.max : 50;
+                size = (min + Math.random() * (max - min)) * sizeMult;
+            } else if (init.name === 'velocityrandom') {
+                const minV = parseVec(init.min, [0, 0, 0]);
+                const maxV = parseVec(init.max, [0, 0, 0]);
+                let vx = (minV[0] + Math.random() * (maxV[0] - minV[0])) * speedMult * this.scale[0];
+                let vy = (minV[1] + Math.random() * (maxV[1] - minV[1])) * speedMult * this.scale[1];
+                let vz = (minV[2] + Math.random() * (maxV[2] - minV[2])) * speedMult;
+                if (rotZ !== 0) {
+                    const rvx = vx * cosR - vy * sinR;
+                    const rvy = vx * sinR + vy * cosR;
+                    vx = rvx; vy = rvy;
+                }
+                vel[0] = vx;
+                vel[1] = vy;
+                vel[2] = vz;
+            } else if (init.name === 'turbulentvelocityrandom') {
+                const sc = (init.scale || 1.0) * speedMult;
+                vel[0] += (Math.random() * 2 - 1) * 30 * sc;
+                vel[1] += (Math.random() * 2 - 1) * 30 * sc;
+            } else if (init.name === 'colorrandom') {
+                const minC = parseVec(init.min, [255, 255, 255]);
+                const maxC = parseVec(init.max, [255, 255, 255]);
+                const r = minC[0] + Math.random() * (maxC[0] - minC[0]);
+                const g = minC[1] + Math.random() * (maxC[1] - minC[1]);
+                const b = minC[2] + Math.random() * (maxC[2] - minC[2]);
+                color[0] = (r > 1.0 ? r / 255.0 : r);
+                color[1] = (g > 1.0 ? g / 255.0 : g);
+                color[2] = (b > 1.0 ? b / 255.0 : b);
+            } else if (init.name === 'rotationrandom') {
+                const min = init.min !== undefined ? init.min : 0;
+                const max = init.max !== undefined ? init.max : Math.PI * 2;
+                rot = min + Math.random() * (max - min);
+            } else if (init.name === 'angularvelocityrandom') {
+                const min = parseVec(init.min, [0, 0, 0]);
+                const max = parseVec(init.max, [0, 0, 0]);
+                angVel = min[2] + Math.random() * (max[2] - min[2]);
+            } else if (init.name === 'alpharandom') {
+                const min = init.min !== undefined ? init.min : 0.5;
+                const max = init.max !== undefined ? init.max : 1.0;
+                const exp = (init.exponent !== undefined && init.exponent !== null) ? Number(init.exponent) : 1.0;
+                const r = exp === 1.0 ? Math.random() : Math.pow(Math.random(), exp);
+                alpha = min + r * (max - min);
+            }
+        }
+
+        color[0] *= (colorTint[0] > 1.0 ? colorTint[0] / 255.0 : colorTint[0]);
+        color[1] *= (colorTint[1] > 1.0 ? colorTint[1] / 255.0 : colorTint[1]);
+        color[2] *= (colorTint[2] > 1.0 ? colorTint[2] / 255.0 : colorTint[2]);
+        alpha *= alphaMult;
+        if (this.blending === 'additive' && size > 400) {
+            alpha *= Math.min(1.0, 400.0 / size);
+        }
+
+        this.particles.push({
+            pos: spawnPos,
+            vel: vel,
+            lifetime: lifetime,
+            maxLifetime: lifetime,
+            age: 0,
+            size: size,
+            baseSize: size,
+            color: color,
+            alpha: alpha,
+            baseAlpha: alpha,
+            rot: rot,
+            angVel: angVel,
+            phase: Math.random() * Math.PI * 2,
+            history: [{ x: spawnPos[0], y: spawnPos[1], t: 0 }]
+        });
+    }
+
+    update(dt, now) {
+        if (this.childType === 'eventfollow' && this.parentId !== null) {
+            let parentSys = null;
+            for (const k in activeParticleSystems) {
+                if (activeParticleSystems[k].def.id === this.parentId) {
+                    parentSys = activeParticleSystems[k];
+                    break;
+                }
+            }
+            if (parentSys) {
+                this.particles = [];
+                const pInitSize = (this.initializers.find(i => i.name === 'sizerandom')?.max || 120);
+                const ov = this.def.instanceoverride || {};
+                const sizeMult = ov.size !== undefined ? Number(ov.size) : 1.0;
+                const baseSz = pInitSize * sizeMult;
+                for (const pp of parentSys.particles) {
+                    this.particles.push({
+                        pos: [pp.pos[0], pp.pos[1], pp.pos[2]],
+                        vel: [0, 0, 0],
+                        lifetime: pp.lifetime,
+                        maxLifetime: pp.maxLifetime,
+                        age: pp.age,
+                        size: baseSz,
+                        baseSize: baseSz,
+                        color: pp.color,
+                        alpha: pp.alpha * 0.7,
+                        baseAlpha: 0.7,
+                        rot: 0,
+                        angVel: 0,
+                        phase: pp.phase,
+                        history: []
+                    });
+                }
+                return;
+            }
+        }
+
+        const ov = this.def.instanceoverride || {};
+        const rateMult = (ov.rate !== undefined) ? Number(ov.rate) : 1.0;
+        let totalRate = 0;
+        for (const em of this.emitters) {
+            totalRate += (em.rate || 10) * rateMult;
+        }
+        this.emitAcc += totalRate * dt;
+        while (this.emitAcc >= 1.0 && this.particles.length < this.maxCount) {
+            this.spawn(now);
+            this.emitAcc -= 1.0;
+        }
+
+        const rotZ = this.angles[2] || 0;
+        const cosR = Math.cos(rotZ);
+        const sinR = Math.sin(rotZ);
+
+        for (let i = this.particles.length - 1; i >= 0; i--) {
+            const p = this.particles[i];
+            p.age += dt;
+            if (p.age >= p.maxLifetime) {
+                this.particles.splice(i, 1);
+                continue;
+            }
+
+            const lifeProg = p.age / p.maxLifetime;
+
+            for (const op of this.operators) {
+                if (op.name === 'movement') {
+                    const grav = parseVec(op.gravity, [0, 0, 0]);
+                    let gx = grav[0];
+                    let gy = grav[1];
+                    if (rotZ !== 0) {
+                        const rgx = gx * cosR - gy * sinR;
+                        const rgy = gx * sinR + gy * cosR;
+                        gx = rgx; gy = rgy;
+                    }
+                    const drag = Number(op.drag || 0);
+                    if (drag > 0) {
+                        p.vel[0] *= Math.max(0, 1.0 - drag * dt);
+                        p.vel[1] *= Math.max(0, 1.0 - drag * dt);
+                    }
+                    p.vel[0] += gx * dt;
+                    p.vel[1] += gy * dt;
+                    p.pos[0] += p.vel[0] * dt;
+                    p.pos[1] += p.vel[1] * dt;
+                } else if (op.name === 'alphafade') {
+                    const lifeProg = p.age / Math.max(0.001, p.maxLifetime);
+                    const fadeIn = (op.fadeintime !== undefined && op.fadeintime !== null) ? Number(op.fadeintime) : 0.1;
+                    const fadeOut = (op.fadeouttime !== undefined && op.fadeouttime !== null) ? Number(op.fadeouttime) : Math.max(0.01, 1.0 - fadeIn);
+                    let a = p.baseAlpha;
+                    if (fadeIn > 0 && lifeProg < fadeIn) {
+                        a *= (lifeProg / fadeIn);
+                    }
+                    const remainingLife = 1.0 - lifeProg;
+                    if (fadeOut > 0 && remainingLife < fadeOut) {
+                        a *= Math.max(0, remainingLife / fadeOut);
+                    }
+                    p.alpha = Math.max(0, a);
+                } else if (op.name === 'oscillateposition') {
+                    const freqMin = op.frequencymin || 0.5;
+                    const freqMax = op.frequencymax || 1.0;
+                    const scaleMax = op.scalemax || 20;
+                    const freq = (freqMin + freqMax) * 0.5;
+                    p.pos[0] += Math.sin(now * freq + p.phase) * scaleMax * dt;
+                } else if (op.name === 'oscillatealpha') {
+                    const freq = ((op.frequencymin || 1) + (op.frequencymax || 2)) * 0.5;
+                    const sc = op.scalemax || 0.5;
+                    p.alpha = Math.max(0, p.baseAlpha * (1.0 + Math.sin(now * freq + p.phase) * sc));
+                } else if (op.name === 'oscillatesize') {
+                    const freq = ((op.frequencymin || 1) + (op.frequencymax || 2)) * 0.5;
+                    const sc = op.scalemax || 0.2;
+                    p.size = p.baseSize * (1.0 + Math.sin(now * freq + p.phase) * sc);
+                } else if (op.name === 'angularmovement') {
+                    p.rot += p.angVel * dt;
+                } else if (op.name === 'sizechange') {
+                    const startV = op.startvalue !== undefined ? op.startvalue : 0;
+                    const endV = op.endvalue !== undefined ? op.endvalue : 1;
+                    p.size = p.baseSize * (startV + lifeProg * (endV - startV));
+                }
+            }
+
+            if (this.isRope) {
+                if (!p.history) p.history = [];
+                p.history.push({ x: p.pos[0], y: p.pos[1], t: p.age });
+                const maxAge = Math.max(0.1, this.trailLength * 1.5);
+                while (p.history.length > 2 && (p.age - p.history[0].t) > maxAge) {
+                    p.history.shift();
+                }
+            }
+        }
+    }
+}
+
+const activeParticleSystems = {};
+const compiledEffectProgs = {};
+
+function getEffectProgram(eff) {
+    if (!eff || !eff.vert || !eff.frag) return null;
+    const key = eff.name;
+    if (compiledEffectProgs[key] !== undefined) return compiledEffectProgs[key];
+    const p = link(eff.vert, eff.frag);
+    compiledEffectProgs[key] = p;
+    return p;
+}
+
+function applyBlend(mode, prog) {
+    gl.enable(gl.BLEND);
+    const premultLoc = prog ? gl.getUniformLocation(prog, 'u_Premultiply') : null;
+    if (mode === 'translucent') {
+        if (premultLoc) gl.uniform1i(premultLoc, 0);
+        gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    } else if (mode === 'additive') {
+        if (premultLoc) gl.uniform1i(premultLoc, 0);
+        gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE, gl.ONE, gl.ONE);
+    } else if (mode === 'multiply') {
+        if (premultLoc) gl.uniform1i(premultLoc, 0);
+        gl.blendFunc(gl.DST_COLOR, gl.ONE_MINUS_SRC_ALPHA);
+    } else if (mode === 'screen') {
+        if (premultLoc) {
+            gl.uniform1i(premultLoc, 1);
+            gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_COLOR, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+        } else {
+            gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_COLOR, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+        }
+    } else {
+        if (premultLoc) gl.uniform1i(premultLoc, 0);
+        gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    }
+}
+
+let copyBgTex = null;
+
+function renderObject(obj, time) {
+    let baseTex = texCache[obj.texture];
+    const oname = (obj.name || '').toLowerCase();
+    const isFullscreen = oname.includes("fullscreen") || obj.fullscreen === true;
+    const isUtil = obj.isUtilLayer || oname.includes("composition layer") || oname.includes("composite") || oname.includes("composelayer") || oname.includes("fullscreenlayer") || oname.includes("projectlayer") || oname.includes("post-processing");
+    const objSz = parseVec(obj.size, null);
+    const shouldCopyBg = (obj.copybackground === true) || (obj.copybackground !== false && (isFullscreen || (isUtil && (objSz === null || (objSz[0] >= PROJ_W * 0.7 && objSz[1] >= PROJ_H * 0.7)))));
+    const isPlaceholder = !baseTex || baseTex.fallback || (obj.texture && (obj.texture.includes("fullscreenlayer") || obj.texture.includes("composelayer")));
+    if (shouldCopyBg && !obj.isFirstBg && (obj.effects && obj.effects.length > 0)) {
+        if (!copyBgTex) {
+            copyBgTex = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, copyBgTex);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        }
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.bindTexture(gl.TEXTURE_2D, copyBgTex);
+        gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 0, 0, RW, RH, 0);
+        if (isPlaceholder) {
+            baseTex = { tex: copyBgTex, w: RW, h: RH };
+        }
+    }
+    if (!baseTex && obj.effects && obj.effects.length > 0) {
+        baseTex = emptyTex;
+    }
+    if (!baseTex || (baseTex.fallback && isUtil)) return null;
+
+    const colorVec = parseVec(obj.color, [1, 1, 1]);
+    const r = colorVec[0] > 1.0 ? colorVec[0] / 255.0 : colorVec[0];
+    const g = colorVec[1] > 1.0 ? colorVec[1] / 255.0 : colorVec[1];
+    const b = colorVec[2] > 1.0 ? colorVec[2] / 255.0 : colorVec[2];
+    const alpha = (obj.alpha !== undefined && obj.alpha !== null) ? Number(obj.alpha) : 1.0;
+    const brightness = (obj.brightness !== undefined && obj.brightness !== null) ? Number(obj.brightness) : 1.0;
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fboA.fbo);
+    gl.viewport(0, 0, RW, RH);
+    gl.disable(gl.BLEND);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    let bgUvScaleX = 1.0, bgUvScaleY = 1.0, bgUvTransX = 0.0, bgUvTransY = 0.0;
+    if (baseTex.tex === copyBgTex && !isFullscreen && obj.origin) {
+        const orig = parseVec(obj.origin, [PROJ_W * 0.5, PROJ_H * 0.5]);
+        const sz = parseVec(obj.size, [PROJ_W, PROJ_H]);
+        const sc = parseVec(obj.scale, [1.0, 1.0]);
+        const w = (sz && sz[0] > 0) ? sz[0] : PROJ_W;
+        const h = (sz && sz[1] > 0) ? sz[1] : PROJ_H;
+        const totalW = w * sc[0];
+        const totalH = h * sc[1];
+        bgUvScaleX = totalW / PROJ_W;
+        bgUvScaleY = totalH / PROJ_H;
+        bgUvTransX = (orig[0] - totalW * 0.5) / PROJ_W;
+        bgUvTransY = (orig[1] - totalH * 0.5) / PROJ_H;
+    }
+
+    gl.useProgram(prepareProg);
+    bindQuad(prepareProg);
+    const mvp = gl.getUniformLocation(prepareProg, 'g_ModelViewProjectionMatrix');
+    if (mvp) gl.uniformMatrix4fv(mvp, false, IDENTITY);
+    gl.uniform4f(gl.getUniformLocation(prepareProg, 'g_Color4'), r, g, b, alpha);
+    gl.uniform1f(gl.getUniformLocation(prepareProg, 'g_Brightness'), brightness);
+    const rotLoc = gl.getUniformLocation(prepareProg, 'g_Texture0Rotation');
+    if (rotLoc) gl.uniform4f(rotLoc, bgUvScaleX, bgUvScaleY, 0, 0);
+    const transLoc = gl.getUniformLocation(prepareProg, 'g_Texture0Translation');
+    if (transLoc) gl.uniform2f(transLoc, bgUvTransX, bgUvTransY);
+    bindTextureSlot(0, baseTex);
+    gl.uniform1i(gl.getUniformLocation(prepareProg, 'g_Texture0'), 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    let src = fboA;
+    let dest = fboB;
+
+    for (const eff of (obj.effects || [])) {
+        const prog = getEffectProgram(eff);
+        if (!prog) continue;
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, dest.fbo);
+        gl.viewport(0, 0, RW, RH);
+        gl.disable(gl.BLEND);
+
+        gl.useProgram(prog);
+        bindQuad(prog);
+        const effMvp = gl.getUniformLocation(prog, 'g_ModelViewProjectionMatrix');
+        if (effMvp) gl.uniformMatrix4fv(effMvp, false, IDENTITY);
+        const effMvp2 = gl.getUniformLocation(prog, 'g_EffectModelViewProjectionMatrix');
+        if (effMvp2) gl.uniformMatrix4fv(effMvp2, false, IDENTITY);
+
+        const effProj = gl.getUniformLocation(prog, 'g_EffectTextureProjectionMatrix');
+        if (effProj) gl.uniformMatrix4fv(effProj, false, IDENTITY);
+        const effProjInv = gl.getUniformLocation(prog, 'g_EffectTextureProjectionMatrixInverse');
+        if (effProjInv) gl.uniformMatrix4fv(effProjInv, false, IDENTITY);
+        const mvpInv = gl.getUniformLocation(prog, 'g_ModelViewProjectionMatrixInverse');
+        if (mvpInv) gl.uniformMatrix4fv(mvpInv, false, IDENTITY);
+        const mmLoc = gl.getUniformLocation(prog, 'g_ModelMatrix');
+        if (mmLoc) gl.uniformMatrix4fv(mmLoc, false, IDENTITY);
+        const vpLoc = gl.getUniformLocation(prog, 'g_ViewProjectionMatrix');
+        if (vpLoc) gl.uniformMatrix4fv(vpLoc, false, IDENTITY);
+
+        const idleX = Math.sin(time * 0.5) * 0.08;
+        const idleY = Math.cos(time * 0.4) * 0.06;
+        const plxX = 0.5 + (mouseX * 0.5 + idleX) * 0.5;
+        const plxY = 0.5 + (mouseY * 0.5 + idleY) * 0.5;
+        const plxLoc = gl.getUniformLocation(prog, 'g_ParallaxPosition');
+        if (plxLoc) gl.uniform2f(plxLoc, plxX, plxY);
+        const screenLoc = gl.getUniformLocation(prog, 'g_Screen');
+        if (screenLoc) gl.uniform3f(screenLoc, RW, RH, RW / RH);
+
+        ['g_Time', 'u_time', 'time', 'iTime'].forEach(tn => {
+            const loc = gl.getUniformLocation(prog, tn);
+            if (loc) gl.uniform1f(loc, time);
+        });
+        const dtLoc = gl.getUniformLocation(prog, 'g_Daytime');
+        if (dtLoc) gl.uniform1f(dtLoc, 0.5);
+
+        const ptrX = ((mouseX + 1.0) * 0.5 + idleX * 0.2) * RW;
+        const ptrY = ((1.0 - (mouseY + 1.0) * 0.5) + idleY * 0.2) * RH;
+        const pSizeLoc = gl.getUniformLocation(prog, 'g_PointerPosition');
+        if (pSizeLoc) gl.uniform2f(pSizeLoc, ptrX, ptrY);
+        const pSizeLastLoc = gl.getUniformLocation(prog, 'g_PointerPositionLast');
+        if (pSizeLastLoc) gl.uniform2f(pSizeLastLoc, ptrX, ptrY);
+
+        const audioArray16L = new Float32Array(16);
+        const audioArray16R = new Float32Array(16);
+        const audioArray32L = new Float32Array(32);
+        const audioArray32R = new Float32Array(32);
+        const audioArray64L = new Float32Array(64);
+        const audioArray64R = new Float32Array(64);
+        if (window.__enableAudioTesting && !window.__audioData) {
+            for (let k = 0; k < 64; k++) {
+                const valL = Math.abs(Math.sin(time * 2.0 + k * 0.2)) * 0.8 + 0.2;
+                const valR = Math.abs(Math.sin(time * 2.0 + k * 0.2 + 0.3)) * 0.8 + 0.2;
+                audioArray64L[k] = valL;
+                audioArray64R[k] = valR;
+                if (k < 32) { audioArray32L[k] = valL; audioArray32R[k] = valR; }
+                if (k < 16) { audioArray16L[k] = valL; audioArray16R[k] = valR; }
+            }
+        } else if (window.__audioData) {
+            for (let k = 0; k < 64; k++) {
+                const valL = window.__audioData[k] || 0.0;
+                const valR = window.__audioData[k + 64] || valL;
+                audioArray64L[k] = valL;
+                audioArray64R[k] = valR;
+                if (k < 32) { audioArray32L[k] = valL; audioArray32R[k] = valR; }
+                if (k < 16) { audioArray16L[k] = valL; audioArray16R[k] = valR; }
+            }
+        }
+        const audioVolLoc = gl.getUniformLocation(prog, 'g_AudioVolume');
+        if (audioVolLoc) {
+            const vol = window.__enableAudioTesting ? (0.7 + 0.3 * Math.sin(time * 3.0)) : (window.__audioVolume || 0.0);
+            gl.uniform1f(audioVolLoc, vol);
+        }
+
+        const specLocs = [
+            ['g_AudioSpectrum16', audioArray16L],
+            ['g_AudioSpectrum16Left', audioArray16L],
+            ['g_AudioSpectrum16Right', audioArray16R],
+            ['g_AudioSpectrum32', audioArray32L],
+            ['g_AudioSpectrum32Left', audioArray32L],
+            ['g_AudioSpectrum32Right', audioArray32R],
+            ['g_AudioSpectrum64', audioArray64L],
+            ['g_AudioSpectrum64Left', audioArray64L],
+            ['g_AudioSpectrum64Right', audioArray64R],
+        ];
+        for (const [sName, sArr] of specLocs) {
+            const loc = gl.getUniformLocation(prog, sName);
+            if (loc) gl.uniform1fv(loc, sArr);
+        }
+
+        bindTextureSlot(0, src);
+        gl.uniform1i(gl.getUniformLocation(prog, 'g_Texture0'), 0);
+
+        const boundSlots = { 0: src };
+        for (let s = 1; s < 8; s++) {
+            const fallback = (s === 2) ? src : (texCache[''] || emptyTex);
+            bindTextureSlot(s, fallback);
+            boundSlots[s] = fallback;
+            const loc = gl.getUniformLocation(prog, 'g_Texture' + s);
+            if (loc) gl.uniform1i(loc, s);
+        }
+
+        for (const [slotStr, texUrl] of Object.entries(eff.textures || {})) {
+            const slot = parseInt(slotStr, 10);
+            if (slot >= 0) {
+                let texEntry = null;
+                if (!texUrl || texUrl === 'previous') {
+                    texEntry = src;
+                } else if (texUrl === '_rt_FullFrameBuffer') {
+                    texEntry = copyBgTex ? { tex: copyBgTex, w: RW, h: RH } : src;
+                } else if (texUrl.startsWith('_rt_')) {
+                    const hasOtherImage = Object.entries(eff.textures || {}).some(([s, u]) => s !== slotStr && (!u || u === 'previous' || u === '_rt_FullFrameBuffer'));
+                    texEntry = hasOtherImage ? emptyTex : src;
+                } else {
+                    texEntry = texCache[texUrl] || (slot === 2 ? src : null);
+                }
+                if (texEntry) {
+                    bindTextureSlot(slot, texEntry);
+                    boundSlots[slot] = texEntry;
+                    const loc = gl.getUniformLocation(prog, 'g_Texture' + slot);
+                    if (loc) gl.uniform1i(loc, slot);
+                }
+            }
+        }
+
+        const baseW = (baseTex && baseTex.w > 1) ? baseTex.w : (obj.size ? parseVec(obj.size, [RW, RH])[0] : RW);
+        const baseH = (baseTex && baseTex.h > 1) ? baseTex.h : (obj.size ? parseVec(obj.size, [RW, RH])[1] : RH);
+
+        for (let s = 0; s < 8; s++) {
+            const resLoc = gl.getUniformLocation(prog, 'g_Texture' + s + 'Resolution');
+            if (resLoc) {
+                let tw = RW, th = RH;
+                if (s === 0) {
+                    tw = baseW;
+                    th = baseH;
+                } else {
+                    const t = boundSlots[s];
+                    tw = (t && t.w > 1) ? t.w : RW;
+                    th = (t && t.h > 1) ? t.h : RH;
+                }
+                gl.uniform4f(resLoc, tw, th, tw, th);
+            }
+        }
+
+        setUniforms(prog, eff.uniforms);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+        const tmp = src;
+        src = dest;
+        dest = tmp;
+    }
+
+    return src;
+}
+
+function getObjectMatrix(obj) {
+    const PROJ_W = SCENE.projection ? SCENE.projection[0] : 1920;
+    const PROJ_H = SCENE.projection ? SCENE.projection[1] : 1080;
+
+    const sceneAspect = PROJ_W / PROJ_H;
+    const viewAspect = RW / RH;
+
+    let fitScaleX = 1.0;
+    let fitScaleY = 1.0;
+
+    if (viewAspect > sceneAspect) {
+        fitScaleY = viewAspect / sceneAspect;
+    } else {
+        fitScaleX = sceneAspect / viewAspect;
+    }
+
+    const baseTex = texCache[obj.texture];
+
+    const isFullscreen = (obj.name && obj.name.toLowerCase().includes("fullscreen")) || obj.fullscreen === true;
+
+    let w = 0, h = 0;
+    if (isFullscreen) {
+        w = PROJ_W;
+        h = PROJ_H;
+    } else if (obj.size !== null && obj.size !== undefined) {
+        const sz = parseVec(obj.size, null);
+        if (sz && sz.length >= 2 && sz[0] > 0 && sz[1] > 0) {
+            w = sz[0];
+            h = sz[1];
+        }
+    }
+
+    if (!w || !h) {
+        if (isFullscreen || !obj.origin) {
+            w = PROJ_W;
+            h = PROJ_H;
+        } else if (baseTex && baseTex.w > 1 && baseTex.h > 1) {
+            w = baseTex.w;
+            h = baseTex.h;
+        } else {
+            w = PROJ_W;
+            h = PROJ_H;
+        }
+    }
+
+    const orig = parseVec(obj.origin, [PROJ_W * 0.5, PROJ_H * 0.5, 0]);
+    const sc = parseVec(obj.scale, [1.0, 1.0, 1.0]);
+    const ang = parseVec(obj.angles, [0, 0, 0]);
+
+    const is3D = !isFullscreen && orig.length >= 3 && orig[2] < -0.001 && Math.abs(orig[0]) <= 20.0 && Math.abs(orig[1]) <= 20.0;
+    if (is3D) {
+        const dist = Math.abs(orig[2]);
+        const fov = (SCENE.camera && SCENE.camera.fov) || (SCENE.general && SCENE.general.fov) || 50.0;
+        const f = 1.0 / Math.tan((fov * 0.5) * Math.PI / 180.0);
+        const posX = (orig[0] / dist) * (f / viewAspect);
+        const posY = (orig[1] / dist) * f;
+        let scaleX = (sc[0] / dist) * (f / viewAspect);
+        let scaleY = (sc[1] / dist) * f;
+
+        if (Math.abs(Math.abs(ang[1]) - Math.PI) < 0.2) {
+            scaleX = -scaleX;
+        }
+
+        const rotZ = ang[2] || 0;
+        if (Math.abs(rotZ) > 1e-5) {
+            const cosR = Math.cos(rotZ);
+            const sinR = Math.sin(rotZ);
+            return new Float32Array([
+                scaleX * cosR, scaleX * sinR, 0, 0,
+                -scaleY * sinR, scaleY * cosR, 0, 0,
+                0, 0, 1, 0,
+                posX, posY, 0, 1
+            ]);
+        }
+
+        return new Float32Array([
+            scaleX, 0, 0, 0,
+            0, scaleY, 0, 0,
+            0, 0, 1, 0,
+            posX, posY, 0, 1
+        ]);
+    }
+
+    let ox = orig[0];
+    let oy = orig[1];
+
+    if (isFullscreen || !obj.origin) {
+        ox = PROJ_W * 0.5;
+        oy = PROJ_H * 0.5;
+    }
+
+    const parAmount = SCENE.cameraparallaxamount || 0.05;
+    const parInf = SCENE.cameraparallaxmouseinfluence || -0.25;
+    const pDepth = parseVec(obj.parallaxDepth, [0.5, 0.5]);
+    const parX = mouseX * parAmount * parInf * pDepth[0] * PROJ_W * 0.2;
+    const parY = mouseY * parAmount * parInf * pDepth[1] * PROJ_H * 0.2;
+
+    ox += parX;
+    oy += parY;
+
+    const scX = sc[0];
+    const scY = sc[1];
+
+    const normX = (ox / PROJ_W) * 2.0 - 1.0;
+    const normY = (oy / PROJ_H) * 2.0 - 1.0;
+    const normW = (w * scX) / PROJ_W;
+    const normH = (h * scY) / PROJ_H;
+
+    const scaleX = normW * fitScaleX;
+    const scaleY = normH * fitScaleY;
+    const posX = normX * fitScaleX;
+    const posY = normY * fitScaleY;
+
+    const rotZ = ang[2] || 0;
+
+    if (Math.abs(rotZ) > 1e-5) {
+        const cosR = Math.cos(rotZ);
+        const sinR = Math.sin(rotZ);
+        return new Float32Array([
+            normW * cosR * fitScaleX, normW * sinR * fitScaleY, 0, 0,
+            -normH * sinR * fitScaleX, normH * cosR * fitScaleY, 0, 0,
+            0, 0, 1, 0,
+            posX, posY, 0, 1
+        ]);
+    }
+
+    return new Float32Array([
+        scaleX, 0, 0, 0,
+        0, scaleY, 0, 0,
+        0, 0, 1, 0,
+        posX, posY, 0, 1
+    ]);
+}
+
+const visibility = {};
+const textCanvasMap = {};
+const loadedFonts = new Set();
+
+function ensureFontLoaded(fontPath) {
+    if (!fontPath || loadedFonts.has(fontPath)) return;
+    if (fontPath.startsWith('systemfont_') || fontPath.startsWith('systemfont:')) return;
+    loadedFonts.add(fontPath);
+    try {
+        const fontName = fontPath.split('/').pop().replace(/\.[^/.]+$/, '');
+        const fontFace = new FontFace(fontName, `url(${encodeURI(fontPath)})`);
+        fontFace.load().then(loaded => {
+            document.fonts.add(loaded);
+        }).catch(() => {});
+    } catch (e) {}
+}
+
+function formatTimeOrDate(script, rawVal) {
+    const now = new Date();
+    const h24 = now.getHours();
+    const h12 = (h24 % 12) || 12;
+    const m = String(now.getMinutes()).padStart(2, '0');
+    const s = String(now.getSeconds()).padStart(2, '0');
+    const ampm = h24 >= 12 ? 'PM' : 'AM';
+    const day = now.getDate();
+    const month = now.getMonth() + 1;
+    const year = now.getFullYear();
+
+    if (script && typeof script === 'string') {
+        const sLower = script.toLowerCase();
+        if (sLower.includes('gethours') && sLower.includes('getminutes')) {
+            if (sLower.includes('ampm') || sLower.includes('pm')) {
+                return `${h12}:${m} ${ampm}`;
+            }
+            return `${String(h24).padStart(2, '0')}:${m}`;
+        }
+        if (sLower.includes('getdate') || sLower.includes('getmonth')) {
+            return `${month}/${day}/${year}`;
+        }
+    }
+
+    if (rawVal !== undefined && rawVal !== null) {
+        if (typeof rawVal === 'string') return rawVal;
+        if (typeof rawVal === 'number') return String(rawVal);
+    }
+    return '';
+}
+
+function renderTextLayer(obj, time) {
+    let entry = textCanvasMap[obj.name];
+    if (!entry) {
+        const offCanvas = document.createElement('canvas');
+        const offCtx = offCanvas.getContext('2d');
+        const tex = gl.createTexture();
+        entry = { canvas: offCanvas, ctx: offCtx, tex: tex, lastStr: '', lastUpdate: 0 };
+        textCanvasMap[obj.name] = entry;
+    }
+
+    const sz = parseVec(obj.size, [600, 200]);
+    const w = Math.max(Math.round(sz[0]), 64);
+    const h = Math.max(Math.round(sz[1]), 64);
+
+    let textStr = '';
+    const rawText = obj.text;
+    if (rawText && typeof rawText === 'object') {
+        if (rawText.script) {
+            textStr = formatTimeOrDate(rawText.script, rawText.value);
+        } else if (rawText.value !== undefined) {
+            textStr = String(rawText.value);
+        }
+    } else if (typeof rawText === 'string') {
+        textStr = rawText;
+    }
+
+    if (entry.canvas.width !== w || entry.canvas.height !== h) {
+        entry.canvas.width = w;
+        entry.canvas.height = h;
+        entry.lastStr = '';
+    }
+
+    const nowMs = performance.now();
+    if (entry.lastStr !== textStr || (nowMs - entry.lastUpdate > 500)) {
+        entry.lastStr = textStr;
+        entry.lastUpdate = nowMs;
+
+        const ctx = entry.ctx;
+        ctx.clearRect(0, 0, w, h);
+
+        ensureFontLoaded(obj.font);
+        const pointsize = obj.pointsize || 36;
+        let fontFamily = 'sans-serif';
+        if (obj.font && typeof obj.font === 'string') {
+            if (obj.font.startsWith('systemfont_')) {
+                const sysName = obj.font.replace('systemfont_', '').toLowerCase();
+                const sysMap = {
+                    'consolas': '"Consolas", monospace',
+                    'courier': '"Courier New", monospace',
+                    'arial': 'Arial, sans-serif',
+                    'times': '"Times New Roman", serif',
+                    'segoeui': '"Segoe UI", sans-serif',
+                    'tahoma': 'Tahoma, sans-serif',
+                    'trebuchet': '"Trebuchet MS", sans-serif',
+                    'verdana': 'Verdana, sans-serif',
+                    'impact': 'Impact, sans-serif'
+                };
+                fontFamily = sysMap[sysName] || `"${sysName}", sans-serif`;
+            } else {
+                const fontBase = obj.font.split('/').pop().replace(/\.[^/.]+$/, '');
+                fontFamily = `"${fontBase}", sans-serif`;
+            }
+        }
+        ctx.font = `${pointsize}px ${fontFamily}`;
+
+        const colorVec = parseVec(obj.color, [1, 1, 1]);
+        const r = Math.round((colorVec[0] > 1.0 ? colorVec[0] / 255.0 : colorVec[0]) * 255);
+        const g = Math.round((colorVec[1] > 1.0 ? colorVec[1] / 255.0 : colorVec[1]) * 255);
+        const b = Math.round((colorVec[2] > 1.0 ? colorVec[2] / 255.0 : colorVec[2]) * 255);
+        const a = (obj.alpha !== undefined && obj.alpha !== null) ? Number(obj.alpha) : 1.0;
+        ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${a})`;
+
+        const halign = (obj.horizontalalign || 'left').toLowerCase();
+        ctx.textAlign = halign === 'center' ? 'center' : (halign === 'right' ? 'right' : 'left');
+        ctx.textBaseline = 'middle';
+
+        let startX = halign === 'center' ? w * 0.5 : (halign === 'right' ? w - 10 : 10);
+        const lines = textStr.split('\n');
+        const lineHeight = pointsize * 1.25;
+        const totalTextH = lines.length * lineHeight;
+        const valig = (obj.verticalalign || 'center').toLowerCase();
+        let startY = valig === 'top' ? lineHeight * 0.8 : (valig === 'bottom' ? h - totalTextH + lineHeight * 0.8 : (h - totalTextH) * 0.5 + lineHeight * 0.8);
+
+        for (let i = 0; i < lines.length; i++) {
+            ctx.fillText(lines[i], startX, startY + i * lineHeight);
+        }
+
+        gl.bindTexture(gl.TEXTURE_2D, entry.tex);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, entry.canvas);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    }
+
+    return { tex: entry.tex, w: w, h: h };
+}
+
+function renderFrame(time, dt) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, RW, RH);
+    const cc = parseVec(SCENE.clearcolor, [0.2, 0.2, 0.2]);
+    const cr = cc[0] > 1.0 ? cc[0] / 255.0 : cc[0];
+    const cg = cc[1] > 1.0 ? cc[1] / 255.0 : cc[1];
+    const cb = cc[2] > 1.0 ? cc[2] / 255.0 : cc[2];
+    gl.clearColor(cr, cg, cb, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    for (let i = 0; i < SCENE.objects.length; i++) {
+        const obj = SCENE.objects[i];
+        if (obj.kind === 'sound' || obj.kind === 'folder') continue;
+        if (obj.visible === false) continue;
+        if (obj.name && visibility[obj.name] === false) continue;
+        const alpha = (obj.alpha !== undefined && obj.alpha !== null) ? Number(obj.alpha) : 1.0;
+        if (alpha <= 0.001) continue;
+
+        if (obj.kind === 'text') {
+            const textTex = renderTextLayer(obj, time);
+            if (!textTex) continue;
+
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.viewport(0, 0, RW, RH);
+            gl.useProgram(compositeProg);
+            applyBlend(obj.blend || 'translucent', compositeProg);
+            bindQuad(compositeProg);
+            const mvp = gl.getUniformLocation(compositeProg, 'g_ModelViewProjectionMatrix');
+            if (mvp) gl.uniformMatrix4fv(mvp, false, getObjectMatrix(obj));
+            bindTextureSlot(0, textTex);
+            gl.uniform1i(gl.getUniformLocation(compositeProg, 'g_Texture0'), 0);
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+            continue;
+        }
+
+        if (obj.kind === 'particle') {
+            const pKey = (obj.id !== undefined && obj.id !== null) ? `${obj.name}_${obj.id}` : `${obj.name}_${i}`;
+            let pSys = activeParticleSystems[pKey];
+            if (!pSys) {
+                pSys = new ParticleSystem(obj);
+                activeParticleSystems[pKey] = pSys;
+            }
+
+            pSys.update(dt || 0.016, time);
+            if (pSys.particles.length === 0) continue;
+
+            const baseTex = texCache[pSys.texture] || emptyTex;
+
+            initParticleBuffers();
+            const PROJ_W = SCENE.projection ? SCENE.projection[0] : 1920;
+            const PROJ_H = SCENE.projection ? SCENE.projection[1] : 1080;
+            const sceneAspect = PROJ_W / PROJ_H;
+            const viewAspect = RW / RH;
+            let fitScaleX = 1.0, fitScaleY = 1.0;
+            if (viewAspect > sceneAspect) {
+                fitScaleY = viewAspect / sceneAspect;
+            } else {
+                fitScaleX = sceneAspect / viewAspect;
+            }
+
+            let vIdx = 0;
+            const estFloats = pSys.particles.length * (pSys.isRope ? 40 : 6) * 9;
+            if (particleVertexData.length < estFloats) {
+                particleVertexData = new Float32Array(Math.max(particleVertexData.length * 2, estFloats + 1024));
+            }
+
+            for (const p of pSys.particles) {
+                const r = p.color[0], g = p.color[1], b = p.color[2], a = p.alpha;
+
+                if (pSys.isRope && p.history && p.history.length >= 2) {
+                    const pts = p.history;
+                    const numPts = pts.length;
+                    for (let k = 0; k < numPts - 1; k++) {
+                        if (vIdx + 6 * 9 >= particleVertexData.length) {
+                            const newBuf = new Float32Array(particleVertexData.length * 2);
+                            newBuf.set(particleVertexData);
+                            particleVertexData = newBuf;
+                        }
+
+                        const p0 = pts[k];
+                        const p1 = pts[k + 1];
+                        const t0 = k / (numPts - 1);
+                        const t1 = (k + 1) / (numPts - 1);
+
+                        const ndcX0 = ((p0.x / PROJ_W) * 2.0 - 1.0) * fitScaleX;
+                        const ndcY0 = ((p0.y / PROJ_H) * 2.0 - 1.0) * fitScaleY;
+                        const ndcX1 = ((p1.x / PROJ_W) * 2.0 - 1.0) * fitScaleX;
+                        const ndcY1 = ((p1.y / PROJ_H) * 2.0 - 1.0) * fitScaleY;
+
+                        let dx = ndcX1 - ndcX0;
+                        let dy = ndcY1 - ndcY0;
+                        const len = Math.hypot(dx, dy) || 0.0001;
+                        const nx = -dy / len;
+                        const ny = dx / len;
+
+                        const baseNdcSz = Math.max((p.size / PROJ_H) * 2.0, 5.0 / PROJ_H);
+                        const w0 = (baseNdcSz / viewAspect) * fitScaleX * (0.05 + 0.95 * t0);
+                        const w1 = (baseNdcSz / viewAspect) * fitScaleX * (0.05 + 0.95 * t1);
+
+                        const a0 = a * Math.pow(t0, 1.3);
+                        const a1 = a * Math.pow(t1, 1.3);
+
+                        const x0_l = ndcX0 - nx * w0 * 0.5;
+                        const y0_l = ndcY0 - ny * w0 * 0.5;
+                        const x0_r = ndcX0 + nx * w0 * 0.5;
+                        const y0_r = ndcY0 + ny * w0 * 0.5;
+
+                        const x1_l = ndcX1 - nx * w1 * 0.5;
+                        const y1_l = ndcY1 - ny * w1 * 0.5;
+                        const x1_r = ndcX1 + nx * w1 * 0.5;
+                        const y1_r = ndcY1 + ny * w1 * 0.5;
+
+                        const v0 = 1.0 - t0;
+                        const v1 = 1.0 - t1;
+
+                        // Tri 1: 0_l, 0_r, 1_l
+                        particleVertexData[vIdx++] = x0_l; particleVertexData[vIdx++] = y0_l; particleVertexData[vIdx++] = 0;
+                        particleVertexData[vIdx++] = 0.0; particleVertexData[vIdx++] = v0;
+                        particleVertexData[vIdx++] = r; particleVertexData[vIdx++] = g; particleVertexData[vIdx++] = b; particleVertexData[vIdx++] = a0;
+
+                        particleVertexData[vIdx++] = x0_r; particleVertexData[vIdx++] = y0_r; particleVertexData[vIdx++] = 0;
+                        particleVertexData[vIdx++] = 1.0; particleVertexData[vIdx++] = v0;
+                        particleVertexData[vIdx++] = r; particleVertexData[vIdx++] = g; particleVertexData[vIdx++] = b; particleVertexData[vIdx++] = a0;
+
+                        particleVertexData[vIdx++] = x1_l; particleVertexData[vIdx++] = y1_l; particleVertexData[vIdx++] = 0;
+                        particleVertexData[vIdx++] = 0.0; particleVertexData[vIdx++] = v1;
+                        particleVertexData[vIdx++] = r; particleVertexData[vIdx++] = g; particleVertexData[vIdx++] = b; particleVertexData[vIdx++] = a1;
+
+                        // Tri 2: 1_l, 0_r, 1_r
+                        particleVertexData[vIdx++] = x1_l; particleVertexData[vIdx++] = y1_l; particleVertexData[vIdx++] = 0;
+                        particleVertexData[vIdx++] = 0.0; particleVertexData[vIdx++] = v1;
+                        particleVertexData[vIdx++] = r; particleVertexData[vIdx++] = g; particleVertexData[vIdx++] = b; particleVertexData[vIdx++] = a1;
+
+                        particleVertexData[vIdx++] = x0_r; particleVertexData[vIdx++] = y0_r; particleVertexData[vIdx++] = 0;
+                        particleVertexData[vIdx++] = 1.0; particleVertexData[vIdx++] = v0;
+                        particleVertexData[vIdx++] = r; particleVertexData[vIdx++] = g; particleVertexData[vIdx++] = b; particleVertexData[vIdx++] = a0;
+
+                        particleVertexData[vIdx++] = x1_r; particleVertexData[vIdx++] = y1_r; particleVertexData[vIdx++] = 0;
+                        particleVertexData[vIdx++] = 1.0; particleVertexData[vIdx++] = v1;
+                        particleVertexData[vIdx++] = r; particleVertexData[vIdx++] = g; particleVertexData[vIdx++] = b; particleVertexData[vIdx++] = a1;
+                    }
+                } else {
+                    if (vIdx + 6 * 9 >= particleVertexData.length) {
+                        const newBuf = new Float32Array(particleVertexData.length * 2);
+                        newBuf.set(particleVertexData);
+                        particleVertexData = newBuf;
+                    }
+
+                    let u0 = 0.0, v0 = 0.0, u1 = 1.0, v1 = 1.0;
+                    let frameAspect = 1.0;
+                    if (pSys.spritesheet && pSys.spritesheet.frames > 1) {
+                        const ss = pSys.spritesheet;
+                        const lifeProg = p.age / Math.max(0.001, p.maxLifetime);
+                        const frameIdx = Math.floor(lifeProg * pSys.sequenceMultiplier * ss.frames) % ss.frames;
+                        const col = frameIdx % ss.cols;
+                        const row = Math.floor(frameIdx / ss.cols);
+                        u0 = col / ss.cols;
+                        u1 = (col + 1) / ss.cols;
+                        v0 = row / ss.rows;
+                        v1 = (row + 1) / ss.rows;
+                        frameAspect = (baseTex && baseTex.w > 0 && baseTex.h > 0) ? ((baseTex.w / ss.cols) / (baseTex.h / ss.rows)) : 1.0;
+                    } else {
+                        frameAspect = (baseTex && baseTex.w > 0 && baseTex.h > 0) ? (baseTex.w / baseTex.h) : 1.0;
+                    }
+
+                    const ndcX = ((p.pos[0] / PROJ_W) * 2.0 - 1.0) * fitScaleX;
+                    const ndcY = ((p.pos[1] / PROJ_H) * 2.0 - 1.0) * fitScaleY;
+                    const baseNdcSz = (p.size / PROJ_H) * 2.0;
+                    const ndcSzX = (baseNdcSz / viewAspect) * fitScaleX * frameAspect;
+                    const ndcSzY = baseNdcSz * fitScaleY;
+
+                    const cosR = Math.cos(p.rot);
+                    const sinR = Math.sin(p.rot);
+
+                    const hsX = ndcSzX * 0.5;
+                    const hsY = ndcSzY * 0.5;
+
+                    const x0 = ndcX + (-hsX * cosR - -hsY * sinR);
+                    const y0 = ndcY + (-hsX * sinR + -hsY * cosR);
+                    const x1 = ndcX + ( hsX * cosR - -hsY * sinR);
+                    const y1 = ndcY + ( hsX * sinR + -hsY * cosR);
+                    const x2 = ndcX + (-hsX * cosR -  hsY * sinR);
+                    const y2 = ndcY + (-hsX * sinR +  hsY * cosR);
+                    const x3 = ndcX + ( hsX * cosR -  hsY * sinR);
+                    const y3 = ndcY + ( hsX * sinR +  hsY * cosR);
+
+                    // Tri 1: c0, c1, c2
+                    particleVertexData[vIdx++] = x0; particleVertexData[vIdx++] = y0; particleVertexData[vIdx++] = 0;
+                    particleVertexData[vIdx++] = u0; particleVertexData[vIdx++] = v0;
+                    particleVertexData[vIdx++] = r; particleVertexData[vIdx++] = g; particleVertexData[vIdx++] = b; particleVertexData[vIdx++] = a;
+
+                    particleVertexData[vIdx++] = x1; particleVertexData[vIdx++] = y1; particleVertexData[vIdx++] = 0;
+                    particleVertexData[vIdx++] = u1; particleVertexData[vIdx++] = v0;
+                    particleVertexData[vIdx++] = r; particleVertexData[vIdx++] = g; particleVertexData[vIdx++] = b; particleVertexData[vIdx++] = a;
+
+                    particleVertexData[vIdx++] = x2; particleVertexData[vIdx++] = y2; particleVertexData[vIdx++] = 0;
+                    particleVertexData[vIdx++] = u0; particleVertexData[vIdx++] = v1;
+                    particleVertexData[vIdx++] = r; particleVertexData[vIdx++] = g; particleVertexData[vIdx++] = b; particleVertexData[vIdx++] = a;
+
+                    // Tri 2: c2, c1, c3
+                    particleVertexData[vIdx++] = x2; particleVertexData[vIdx++] = y2; particleVertexData[vIdx++] = 0;
+                    particleVertexData[vIdx++] = u0; particleVertexData[vIdx++] = v1;
+                    particleVertexData[vIdx++] = r; particleVertexData[vIdx++] = g; particleVertexData[vIdx++] = b; particleVertexData[vIdx++] = a;
+
+                    particleVertexData[vIdx++] = x1; particleVertexData[vIdx++] = y1; particleVertexData[vIdx++] = 0;
+                    particleVertexData[vIdx++] = u1; particleVertexData[vIdx++] = v0;
+                    particleVertexData[vIdx++] = r; particleVertexData[vIdx++] = g; particleVertexData[vIdx++] = b; particleVertexData[vIdx++] = a;
+
+                    particleVertexData[vIdx++] = x3; particleVertexData[vIdx++] = y3; particleVertexData[vIdx++] = 0;
+                    particleVertexData[vIdx++] = u1; particleVertexData[vIdx++] = v1;
+                    particleVertexData[vIdx++] = r; particleVertexData[vIdx++] = g; particleVertexData[vIdx++] = b; particleVertexData[vIdx++] = a;
+                }
+            }
+
+            if (vIdx === 0) continue;
+
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.viewport(0, 0, RW, RH);
+            applyBlend(pSys.blending || 'additive');
+            gl.useProgram(particleProg);
+            gl.uniform1i(gl.getUniformLocation(particleProg, 'u_BlendMode'), (pSys.blending === 'translucent') ? 0 : 1);
+            gl.bindVertexArray(particleVao);
+            gl.bindBuffer(gl.ARRAY_BUFFER, particleVbo);
+            gl.bufferData(gl.ARRAY_BUFFER, particleVertexData.subarray(0, vIdx), gl.DYNAMIC_DRAW);
+
+            const idMat = new Float32Array([1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0, 0, 0, 1]);
+            gl.uniformMatrix4fv(gl.getUniformLocation(particleProg, 'g_ModelViewProjectionMatrix'), false, idMat);
+            gl.uniform1f(gl.getUniformLocation(particleProg, 'g_Overbright'), pSys.overbright);
+            bindTextureSlot(0, baseTex);
+            gl.uniform1i(gl.getUniformLocation(particleProg, 'g_Texture0'), 0);
+
+            gl.drawArrays(gl.TRIANGLES, 0, vIdx / 9);
+            gl.bindVertexArray(null);
+            continue;
+        }
+
+        if (obj.mesh && obj.mesh.submeshes && obj.mesh.submeshes.length > 0) {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.viewport(0, 0, RW, RH);
+            applyBlend(obj.blend || 'translucent');
+            gl.enable(gl.DEPTH_TEST);
+            gl.depthFunc(gl.LEQUAL);
+
+            const eff = (obj.effects && obj.effects.length > 0) ? obj.effects[0] : null;
+            const prog = eff ? getEffectProgram(eff) : compositeProg;
+            if (prog) {
+                gl.useProgram(prog);
+
+                const mMat = get3DModelMatrix(obj);
+                const vpMat = getCameraViewProjMatrix();
+                const mvpMat = mat4Mul(vpMat, mMat);
+
+                const mLoc = gl.getUniformLocation(prog, 'g_ModelMatrix');
+                if (mLoc) gl.uniformMatrix4fv(mLoc, false, mMat);
+                const vpLoc = gl.getUniformLocation(prog, 'g_ViewProjectionMatrix');
+                if (vpLoc) gl.uniformMatrix4fv(vpLoc, false, vpMat);
+                const mvpLoc = gl.getUniformLocation(prog, 'g_ModelViewProjectionMatrix');
+                if (mvpLoc) gl.uniformMatrix4fv(mvpLoc, false, mvpMat);
+
+                const timeLoc = gl.getUniformLocation(prog, 'g_Time');
+                if (timeLoc) gl.uniform1f(timeLoc, time);
+
+                if (eff) {
+                    for (const [slotStr, texUrl] of Object.entries(eff.textures || {})) {
+                        const slot = parseInt(slotStr, 10);
+                        const texEntry = texCache[texUrl] || emptyTex;
+                        bindTextureSlot(slot, texEntry);
+                        const loc = gl.getUniformLocation(prog, 'g_Texture' + slot);
+                        if (loc) gl.uniform1i(loc, slot);
+                    }
+                    setUniforms(prog, eff.uniforms);
+                } else {
+                    const baseTex = texCache[obj.texture] || emptyTex;
+                    bindTextureSlot(0, baseTex);
+                    const loc = gl.getUniformLocation(prog, 'g_Texture0');
+                    if (loc) gl.uniform1i(loc, 0);
+                }
+
+                for (let sIdx = 0; sIdx < obj.mesh.submeshes.length; sIdx++) {
+                    const sm = obj.mesh.submeshes[sIdx];
+                    const meshKey = `${obj.id || obj.name}_sm${sIdx}`;
+                    const buffers = getMeshBuffers(meshKey, sm);
+                    bindMesh(prog, buffers);
+                    gl.drawElements(gl.TRIANGLES, buffers.indexCount, gl.UNSIGNED_SHORT, 0);
+                }
+            }
+            gl.disable(gl.DEPTH_TEST);
+            gl.bindVertexArray(null);
+            continue;
+        }
+
+        const baseTex = texCache[obj.texture];
+        const isUtil = obj.isUtilLayer || (obj.name && (obj.name.toLowerCase().includes("composition layer") || obj.name.toLowerCase().includes("composite") || obj.name.toLowerCase().includes("composelayer") || obj.name.toLowerCase().includes("fullscreenlayer") || obj.name.toLowerCase().includes("post-processing")));
+        const isSolid = obj.solidlayer || (obj.name && obj.name.toLowerCase().includes("solidlayer")) || (obj.texture && obj.texture.includes("solidlayer"));
+        if (!baseTex && (!obj.effects || obj.effects.length === 0) && !obj.isFirstBg && !isUtil && !isSolid) {
+            continue;
+        }
+        if (baseTex && baseTex.fallback && (!obj.effects || obj.effects.length === 0) && !obj.isFirstBg && !isUtil && !isSolid && !obj.copybackground) {
+            continue;
+        }
+
+        const result = renderObject(obj, time);
+        if (!result) continue;
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, 0, RW, RH);
+        gl.useProgram(compositeProg);
+        const oname = (obj.name || '').toLowerCase();
+        const isFullscreen = oname.includes("fullscreen") || obj.fullscreen === true;
+        const isFullscreenPost = (isFullscreen || isUtil) && !obj.isFirstBg && (obj.effects && obj.effects.length > 0);
+        if (isFullscreenPost) {
+            gl.disable(gl.BLEND);
+        } else {
+            applyBlend(obj.blend || 'translucent', compositeProg);
+        }
+        bindQuad(compositeProg);
+        const mvp = gl.getUniformLocation(compositeProg, 'g_ModelViewProjectionMatrix');
+        if (mvp) gl.uniformMatrix4fv(mvp, false, getObjectMatrix(obj));
+        bindTextureSlot(0, { tex: result.tex, w: result.w, h: result.h });
+        gl.uniform1i(gl.getUniformLocation(compositeProg, 'g_Texture0'), 0);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+}
+
+const allTexUrls = new Set();
+SCENE.objects.forEach(o => {
+    if (o.kind === 'particle') {
+        if (o.material && o.material.texture && !o.material.texture.startsWith('_rt_') && o.material.texture !== 'previous') {
+            allTexUrls.add(o.material.texture);
+        }
+    } else {
+        if (o.texture && !o.texture.startsWith('_rt_') && o.texture !== 'previous') allTexUrls.add(o.texture);
+        (o.effects || []).forEach(e => {
+            Object.values(e.textures || {}).forEach(t => {
+                if (t && !t.startsWith('_rt_') && t !== 'previous') allTexUrls.add(t);
+            });
+        });
+    }
+});
+
+window.__playbackSpeed = 1.0;
+window.__audioListeners = [];
+window.wallpaperRegisterAudioListener = function(callback) {
+    if (typeof callback === 'function') {
+        window.__audioListeners.push(callback);
+    }
+};
+window.dispatchAudioUpdate = function(audioArr) {
+    window.__audioData = audioArr;
+    for (const cb of window.__audioListeners) {
+        try { cb(audioArr); } catch(e) {}
+    }
+};
+
+window.wallpaperPropertyListener = {
+    applyUserProperties: function(props) {
+        if (!props) return;
+        for (const [key, propObj] of Object.entries(props)) {
+            const val = (propObj && typeof propObj === 'object' && 'value' in propObj) ? propObj.value : propObj;
+            const lkey = key.toLowerCase();
+
+            SCENE.objects.forEach(obj => {
+                const oname = (obj.name || '').toLowerCase();
+                const userVis = (obj.user_vis || '').toLowerCase();
+                const matches = (userVis && userVis === lkey) || (oname.length > 0 && oname === lkey);
+                if (matches) {
+                    if (typeof val === 'boolean') {
+                        visibility[obj.name] = val;
+                        obj.visible = val;
+                    }
+                }
+            });
+
+            SCENE.objects.forEach(obj => {
+                (obj.effects || []).forEach(eff => {
+                    if (eff.uniforms) {
+                        for (const uName of Object.keys(eff.uniforms)) {
+                            const luName = uName.toLowerCase().replace(/^g_/, '');
+                            if (luName === lkey) {
+                                eff.uniforms[uName] = val;
+                            }
+                        }
+                    }
+                });
+            });
+
+            if (lkey === 'playbackspeed' || lkey === 'speed') {
+                if (typeof val === 'number') {
+                    window.__playbackSpeed = val;
+                }
+            }
+        }
+    },
+    applyGeneralProperties: function(props) {
+        if (!props) return;
+        if (typeof props.fps === 'number') {
+            window.__targetFps = props.fps;
+        }
+    }
+};
+
+if (SCENE.properties) {
+    try { window.wallpaperPropertyListener.applyUserProperties(SCENE.properties); } catch(e) {}
+}
+
+allTexUrls.forEach(loadTexture);
+Promise.all(Array.from(allTexUrls).map(loadTexture)).then(() => {
+    window.__SCENE_READY__ = true;
+});
+setTimeout(() => { window.__SCENE_READY__ = true; }, 1000);
+
+let lastTime = performance.now();
+function tick(now) {
+    const speed = window.__playbackSpeed || 1.0;
+    const dt = Math.min((now - lastTime) * 0.001 * speed, 0.1);
+    lastTime = now;
+    const t = (window.__testTime !== undefined) ? window.__testTime : ((now * 0.001) * speed);
+    try {
+        renderFrame(t, dt);
+    } catch (err) {
+        console.error("renderFrame error:", err);
+    }
+}
+
+function loop(now) {
+    tick(now);
+    requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// Continuous heartbeat ensuring 60 FPS animation loop even when background window is throttled by Wayland compositor
+setInterval(() => {
+    const now = performance.now();
+    if (now - lastTime > 30) {
+        tick(now);
+    }
+}, 16);
+</script>
+</body>
+</html>

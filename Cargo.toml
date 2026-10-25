@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hyprwpe-core",
+    "crates/hyprwpe-unpacker",
+    "crates/hyprwpe-scene",
+    "crates/hyprwpe-runner",
+    "crates/hyprwpe-gui",
+    "crates/hyprwpe-eval",
+    "crates/hyprwpe-web",
+]

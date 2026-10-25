@@ -1,3 +1,12 @@
 /Releases
 /.claude
 /we_scene_renderer
+/target
+.idea/
+__pycache__/
+*.pyc
+*.swp
+*.bak
+tests/output/
+node_modules/
+tests/node_modules/

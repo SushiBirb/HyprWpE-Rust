@@ -3,8 +3,10 @@
 # --- Configuration ---
 # Path to the Wallpaper Engine workshop content folder
 WALLPAPER_DIR="~/.steam/steam/steamapps/workshop/content/431960"
-# Default monitor (overridden if user passes second argument)
-DEFAULT_MONITOR="DP-1"
+# Default monitor (auto-detected if available)
+DETECTED_MONITOR=$(hyprctl monitors -j 2>/dev/null | jq -r '.[0].name // empty')
+DEFAULT_MONITOR="${DETECTED_MONITOR:-DP-2}"
+
 # YAML config file for saved monitor setups
 YAML_FILE="~/.config/HyprWpE/wallpapers.yaml"
 # YAML config file for per-wallpaper properties
@@ -14,6 +16,9 @@ TMP_DIR="/tmp/HyprWpE"
 
 # Use argument for monitor if provided, else default
 MONITOR="${2:-$DEFAULT_MONITOR}"
+
+# Absolute directory of this script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Temporary file to store the PID, now monitor-specific
 PID_FILE="/tmp/HyprWpE-${MONITOR}.pid"
@@ -111,8 +116,8 @@ set_wallpaper() {
         fi
     fi
 
-    # Unpacking logic (for video/web)
-    if [ "$type" != "scene" ] && [ ! -f "$wallpaper_path/$file" ]; then
+    # Unpacking logic (for video/web/scene)
+    if [ ! -f "$wallpaper_path/$file" ] || [ "$type" == "scene" ]; then
         local pkg_file=$(find "$wallpaper_path" -name "*.pkg" -print -quit)
         if [ -n "$pkg_file" ]; then
             content_root="$TMP_DIR/$wallpaper_id"
@@ -120,9 +125,6 @@ set_wallpaper() {
             # Copy project.json if it was not in the archive
             if [ ! -f "$content_root/project.json" ] && [ -f "$wallpaper_path/project.json" ]; then
                 cp "$wallpaper_path/project.json" "$content_root/"
-            fi
-            if [ ! -f "$content_root/project.json" ] && [ ! -f "$content_root/$file" ]; then
-                echo "Error: Unpack failed"; return 1;
             fi
         fi
     fi
@@ -137,48 +139,17 @@ set_wallpaper() {
     elif [ "$type" == "web" ]; then
         local html_path="$content_root/$file"
         echo "[$MONITOR] Launching web_viewer as a layer-shell surface."
-        LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so python "$(dirname "$0")/web_viewer.py" "$html_path" "$MONITOR" &
+        nohup env LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so python3 "$SCRIPT_DIR/web_viewer.py" "$html_path" "$MONITOR" > /dev/null 2>&1 &
         write_pid $!
+        disown
 
     elif [ "$type" == "scene" ]; then
-        echo "[$MONITOR] Launching linux-wallpaperengine for $content_root"
-        
-        export HYPRWPE_OFFSET_X=$(hyprctl monitors -j | jq -r ".[] | select(.name==\"$MONITOR\") | .x")
-        export HYPRWPE_OFFSET_Y=$(hyprctl monitors -j | jq -r ".[] | select(.name==\"$MONITOR\") | .y")
-        
-        local silent_arg="--silent"
-        if [ "$audio" == "true" ]; then silent_arg=""; fi
-        
-        local scene_opts_array=()
-        local props_file="$(eval echo $PROPERTIES_FILE)"
-        if [ -f "$props_file" ]; then
-            echo "[$MONITOR] Parsing scene properties from $props_file for $wallpaper_id"
-            local scene_keys=$(yq -r ".[\"$wallpaper_id\"].scene_props | keys | .[]" "$props_file" 2>/dev/null)
-            echo "[$MONITOR] Extracted scene keys: $scene_keys"
-            if [ -n "$scene_keys" ] && [ "$scene_keys" != "null" ]; then
-                for k in $scene_keys; do
-                    local v=$(yq -r ".[\"$wallpaper_id\"].scene_props.[\"$k\"]" "$props_file" 2>/dev/null)
-                    # Convert json true/false to 1/0 that linux-wallpaperengine JS expects
-                    if [ "$v" = "true" ]; then v="1"; fi
-                    if [ "$v" = "false" ]; then v="0"; fi
-                    scene_opts_array+=("--set-property" "$k=$v")
-                done
-            fi
-        fi
-        
-        local span_arg="--screen-root \"$MONITOR\""
-        if [[ "$MONITOR" == *","* ]]; then
-            span_arg="--screen-span \"$MONITOR\""
-        fi
-        
-        # If we_scale isn't set (e.g. fallback), default to fill
-        we_scale=${we_scale:-fill}
-        
-        # Use the system-wide installed linux-wallpaperengine instead of a local build folder
-        local engine_bin="linux-wallpaperengine"
-        echo "Running with: $engine_bin $span_arg --scaling $we_scale --bg $content_root --fps 60 --no-fullscreen-pause $silent_arg ${scene_opts_array[*]}"
-        eval "$engine_bin $span_arg --scaling $we_scale --bg \"$content_root\" --fps 60 --no-fullscreen-pause $silent_arg \"\${scene_opts_array[@]}\" >> \"$HOME/.config/HyprWpE/we_${MONITOR}.log\" 2>&1 &"
+        echo "[$MONITOR] Launching native WebGL scene renderer for $content_root"
+        python3 "$SCRIPT_DIR/scene_generator.py" "$content_root"
+        local html_path="$content_root/index.html"
+        nohup env LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so python3 "$SCRIPT_DIR/web_viewer.py" "$html_path" "$MONITOR" > /dev/null 2>&1 &
         write_pid $!
+        disown
     else
         echo "[$MONITOR] Unsupported wallpaper type: $type"
     fi
